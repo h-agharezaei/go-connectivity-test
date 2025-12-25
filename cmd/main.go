@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/joho/godotenv"
+	"github.com/nats-io/nats.go"
 	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
-	"github.com/nats-io/nats.go"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -17,12 +19,18 @@ import (
 var ctx = context.Background()
 
 func main() {
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+
 	log.Println("🔍 Starting connectivity tests...")
 
 	testPostgres()
 	testRedis()
 	testMongo()
 	testNATS()
+	testJetStream()
 	testKafka()
 
 	log.Println("✅ All tests finished")
@@ -31,7 +39,12 @@ func main() {
 // ---------- Postgres ----------
 func testPostgres() {
 	log.Print("Postgres: ")
-	conn, err := pgx.Connect(ctx, "postgres://user:password@localhost:54321/dbname")
+	user := os.Getenv("POSTGRES_USER")
+	password := os.Getenv("POSTGRES_PASSWORD")
+	host := os.Getenv("POSTGRES_HOST")
+	port := os.Getenv("POSTGRES_PORT")
+	connStr := fmt.Sprintf("postgres://%s:%s@%s:%s/", user, password, host, port)
+	conn, err := pgx.Connect(ctx, connStr)
 	if err != nil {
 		log.Println("❌ FAILED:", err)
 		return
@@ -48,8 +61,10 @@ func testPostgres() {
 // ---------- Redis ----------
 func testRedis() {
 	log.Print("Redis: ")
+	host := os.Getenv("REDIS_HOST")
+	port := os.Getenv("REDIS_PORT")
 	rdb := redis.NewClient(&redis.Options{
-		Addr: "localhost:6350",
+		Addr: fmt.Sprintf("%s:%s", host, port),
 	})
 
 	if err := rdb.Ping(ctx).Err(); err != nil {
@@ -62,7 +77,8 @@ func testRedis() {
 // ---------- Mongo ----------
 func testMongo() {
 	log.Print("Mongo: ")
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
+	uri := os.Getenv("MONGO_URI")
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
 	if err != nil {
 		log.Println("❌ FAILED:", err)
 		return
@@ -81,7 +97,8 @@ func testMongo() {
 // ---------- NATS ----------
 func testNATS() {
 	log.Print("NATS: ")
-	nc, err := nats.Connect("nats://localhost:42220")
+	url := os.Getenv("NATS_URL")
+	nc, err := nats.Connect(url)
 	if err != nil {
 		log.Println("❌ FAILED:", err)
 		return
@@ -95,27 +112,81 @@ func testNATS() {
 	log.Println("✅ OK")
 }
 
+func testJetStream() {
+	log.Print("NATS JetStream: ")
+
+	url := os.Getenv("NATS_JS_URL")
+	nc, err := nats.Connect(url)
+	if err != nil {
+		log.Println("❌ FAILED (connect):", err)
+		return
+	}
+	defer nc.Close()
+
+	js, err := nc.JetStream()
+	if err != nil {
+		log.Println("❌ FAILED (jetstream not enabled):", err)
+		return
+	}
+
+	// 1️⃣ Ensure Stream
+	streamName := "HEALTH"
+	subject := "health.jetstream"
+
+	_, err = js.StreamInfo(streamName)
+	if err != nil {
+		_, err = js.AddStream(&nats.StreamConfig{
+			Name:      streamName,
+			Subjects:  []string{subject},
+			Storage:   nats.MemoryStorage,
+			Retention: nats.LimitsPolicy,
+		})
+		if err != nil {
+			log.Println("❌ FAILED (create stream):", err)
+			return
+		}
+	}
+
+	// 2️⃣ Publish
+	_, err = js.Publish(subject, []byte("ping"))
+	if err != nil {
+		log.Println("❌ FAILED (publish):", err)
+		return
+	}
+
+	// 3️⃣ Consumer (Pull)
+	sub, err := js.PullSubscribe(subject, "health-consumer",
+		nats.BindStream(streamName),
+	)
+	if err != nil {
+		log.Println("❌ FAILED (consumer):", err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	msgs, err := sub.Fetch(1, nats.Context(ctx))
+	if err != nil || len(msgs) == 0 {
+		log.Println("❌ FAILED (fetch):", err)
+		return
+	}
+
+	msgs[0].Ack()
+	log.Println("✅ OK")
+}
+
 // ---------- Kafka ----------
 func testKafka() {
 	log.Print("Kafka: ")
 
-	writer := kafka.NewWriter(kafka.WriterConfig{
-		Brokers:  []string{"localhost:9092"},
-		Topic:    "health-check",
-		Balancer: &kafka.LeastBytes{},
-	})
-	defer writer.Close()
-
-	ctxTimeout, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	err := writer.WriteMessages(ctxTimeout,
-		kafka.Message{Value: []byte("ping")},
-	)
+	host := os.Getenv("KAFKA_HOST")
+	port := os.Getenv("KAFKA_PORT")
+	conn, err := kafka.Dial("tcp", fmt.Sprintf("%s:%s", host, port))
 	if err != nil {
 		log.Println("❌ FAILED:", err)
 		return
 	}
-
+	defer conn.Close()
 	log.Println("✅ OK")
 }
